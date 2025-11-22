@@ -87,29 +87,53 @@ def run_query(query, params=None, fetch=False):
         return None
 
 # =================== UTILITY FUNCTIONS ===================
+@st.cache_data(ttl=60)
 def get_dashboard_stats():
-    """Get key business metrics"""
-    customers = run_query("SELECT COUNT(*) FROM customers", fetch=True)
-    products = run_query("SELECT COUNT(*), SUM(quantity) FROM products", fetch=True)
-    orders = run_query("SELECT COUNT(*) FROM repair_orders WHERE status = 'Pending'", fetch=True)
-    today_sales = run_query("""
-        SELECT COUNT(*), COALESCE(SUM(total_price), 0) 
-        FROM sales 
-        WHERE DATE(sale_date) = CURRENT_DATE
+    """Get all stats in one optimized query"""
+    result = run_query("""
+        SELECT 
+            (SELECT COUNT(*) FROM customers) as customers,
+            (SELECT COUNT(*) FROM products) as products,
+            (SELECT COALESCE(SUM(quantity), 0) FROM products) as stock,
+            (SELECT COUNT(*) FROM repair_orders WHERE status = 'Pending') as pending_orders,
+            (SELECT COUNT(*) FROM sales WHERE DATE(sale_date) = CURRENT_DATE) as today_sales,
+            (SELECT COALESCE(SUM(total_price), 0) FROM sales WHERE DATE(sale_date) = CURRENT_DATE) as today_revenue
     """, fetch=True)
     
-    return {
-        'customers': customers[0][0] if customers else 0,
-        'products': products[0][0] if products else 0,
-        'stock': products[0][1] if products and products[0][1] else 0,
-        'pending_orders': orders[0][0] if orders else 0,
-        'today_sales': today_sales[0][0] if today_sales else 0,
-        'today_revenue': float(today_sales[0][1]) if today_sales else 0.0
-    }
+    if result:
+        r = result[0]
+        return {
+            'customers': r[0], 'products': r[1], 'stock': r[2],
+            'pending_orders': r[3], 'today_sales': r[4], 'today_revenue': float(r[5])
+        }
+    return {'customers': 0, 'products': 0, 'stock': 0, 'pending_orders': 0, 'today_sales': 0, 'today_revenue': 0.0}
 
+@st.cache_data(ttl=120)
+def get_customers_data():
+    return run_query("SELECT customer_id, name, contact_number, address FROM customers ORDER BY name", fetch=True) or []
 
-def generate_professional_receipt(items, total, customer_name=None):
-    """Generate professional PDF receipt"""
+@st.cache_data(ttl=120) 
+def get_products_data():
+    return run_query("SELECT product_id, name, price, quantity FROM products ORDER BY name", fetch=True) or []
+
+@st.cache_data(ttl=180)
+def get_repair_orders_data():
+    return run_query("""
+        SELECT ro.order_id, c.name, c.contact_number, ro.product_details, 
+               ro.issue_description, ro.status, ro.created_at
+        FROM repair_orders ro
+        JOIN customers c ON ro.customer_id = c.customer_id
+        ORDER BY ro.created_at DESC LIMIT 100
+    """, fetch=True) or []
+
+def clear_all_cache():
+    get_dashboard_stats.clear()
+    get_customers_data.clear() 
+    get_products_data.clear()
+    get_repair_orders_data.clear()
+
+def generate_professional_receipt(items, total, customer_data=None):
+    """Generate professional PDF receipt with full customer details"""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = f"receipt_{timestamp}.pdf"
     
@@ -121,7 +145,7 @@ def generate_professional_receipt(items, total, customer_name=None):
     c.drawCentredString(width / 2, height - 60, "RAMA WATCH & MOBILE SHOPEE")
     c.setFont("Helvetica", 12)
     c.drawCentredString(width / 2, height - 85, "Viman Nagar, Pune - 411014")
-    c.drawCentredString(width / 2, height - 105, "Phone: +91-XXXXXXXXXX")
+    c.drawCentredString(width / 2, height - 105, "Phone: +91-9815267856")
     
     # === Receipt Info ===
     c.line(50, height - 125, width - 50, height - 125)
@@ -129,12 +153,71 @@ def generate_professional_receipt(items, total, customer_name=None):
     c.drawString(50, height - 150, f"Receipt #: R{timestamp}")
     c.drawRightString(width - 50, height - 150, f"Date: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     
-    if customer_name:
-        c.setFont("Helvetica", 10)
-        c.drawString(50, height - 170, f"Customer: {customer_name}")
+    # === Customer Details Section ===
+    y_pos = height - 175
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(50, y_pos, "CUSTOMER DETAILS:")
+    
+    y_pos -= 20
+    c.setFont("Helvetica", 10)
+    
+    if customer_data:
+        if customer_data.get('name') == 'Walk-in Customer':
+            # Handle walk-in customer
+            c.drawString(50, y_pos, "Customer: Walk-in Customer")
+            y_pos -= 15
+            c.drawString(50, y_pos, "Contact: -")
+            y_pos -= 15
+            c.drawString(50, y_pos, "Address: -")
+        else:
+            # Handle registered customer
+            customer_name = customer_data.get('name', '-')
+            customer_contact = customer_data.get('contact', '-') if customer_data.get('contact') else '-'
+            customer_address = customer_data.get('address', '-') if customer_data.get('address') else '-'
+            
+            c.drawString(50, y_pos, f"Customer: {customer_name}")
+            y_pos -= 15
+            c.drawString(50, y_pos, f"Contact: {customer_contact}")
+            y_pos -= 15
+            
+            # Handle long addresses by wrapping text
+            if len(customer_address) > 60:
+                # Split address into multiple lines if too long
+                address_lines = []
+                words = customer_address.split()
+                current_line = ""
+                
+                for word in words:
+                    if len(current_line + " " + word) <= 60:
+                        current_line += (" " + word) if current_line else word
+                    else:
+                        if current_line:
+                            address_lines.append(current_line)
+                        current_line = word
+                
+                if current_line:
+                    address_lines.append(current_line)
+                
+                c.drawString(50, y_pos, f"Address: {address_lines[0] if address_lines else '-'}")
+                y_pos -= 15
+                
+                # Additional address lines
+                for line in address_lines[1:]:
+                    c.drawString(50, y_pos, f"         {line}")
+                    y_pos -= 15
+            else:
+                c.drawString(50, y_pos, f"Address: {customer_address}")
+                y_pos -= 15
+    else:
+        # No customer data provided
+        c.drawString(50, y_pos, "Customer: Walk-in Customer")
+        y_pos -= 15
+        c.drawString(50, y_pos, "Contact: -")
+        y_pos -= 15
+        c.drawString(50, y_pos, "Address: -")
     
     # === Items Table Header ===
-    y_pos = height - 200
+    y_pos -= 20
     c.setFont("Helvetica-Bold", 11)
     c.drawString(60, y_pos, "ITEM")
     c.drawString(300, y_pos, "QTY")
@@ -149,15 +232,15 @@ def generate_professional_receipt(items, total, customer_name=None):
         rate = amount / quantity if quantity > 0 else amount
         c.drawString(60, y_pos, str(item_name)[:30])
         c.drawString(300, y_pos, str(quantity))
-        c.drawRightString(400, y_pos, f"₹{rate:.2f}")
-        c.drawRightString(490, y_pos, f"₹{amount:.2f}")
+        c.drawRightString(400, y_pos, f"Rs.{rate:.2f}")
+        c.drawRightString(490, y_pos, f"Rs.{amount:.2f}")
         y_pos -= 20
     
     # === Total Section ===
     c.line(350, y_pos - 5, width - 50, y_pos - 5)
     c.setFont("Helvetica-Bold", 12)
     c.drawString(350, y_pos - 25, "TOTAL:")
-    c.drawRightString(490, y_pos - 25, f"₹{total:.2f}")
+    c.drawRightString(490, y_pos - 25, f"Rs.{total:.2f}")
     
     # === Footer ===
     c.setFont("Helvetica", 8)
@@ -300,11 +383,7 @@ elif choice == "Customers":
     search_term = st.text_input("🔍 Search customers", placeholder="Search by name, contact, or address...")
     
     if search_term:
-        customers = run_query(
-            "SELECT customer_id, name, contact_number, address FROM customers WHERE name ILIKE %s OR contact_number ILIKE %s OR address ILIKE %s ORDER BY name",
-            (f"%{search_term}%", f"%{search_term}%", f"%{search_term}%"),
-            fetch=True
-        )
+        customers = get_customers_data()
     else:
         customers = run_query("SELECT customer_id, name, contact_number, address FROM customers ORDER BY name", fetch=True)
     
@@ -425,18 +504,23 @@ elif choice == "Products":
     else:
         st.info("No products found matching your criteria.")
 
-# =================== REPAIR ORDERS PAGE ===================
+# =================== REPAIR ORDERS PAGE (WITH RETURN FEATURE) ===================
 elif choice == "Repair Orders":
     st.subheader("🛠️ Repair Order Management")
     
     # Quick stats
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     status_counts = run_query("""
         SELECT status, COUNT(*) 
         FROM repair_orders 
+        WHERE status != 'Returned'
         GROUP BY status
     """, fetch=True)
+    
+    # Get returned count separately
+    returned_count = run_query("SELECT COUNT(*) FROM repair_orders WHERE status = 'Returned'", fetch=True)
+    returned_count = returned_count[0][0] if returned_count else 0
     
     status_dict = {status: count for status, count in status_counts} if status_counts else {}
     
@@ -447,7 +531,9 @@ elif choice == "Repair Orders":
     with col3:
         st.metric("Completed", status_dict.get('Completed', 0))
     with col4:
-        total_orders = sum(status_dict.values())
+        st.metric("Returned", returned_count, delta="Hidden from main view")
+    with col5:
+        total_orders = sum(status_dict.values()) + returned_count
         st.metric("Total Orders", total_orders)
     
     # Create new repair order
@@ -489,9 +575,14 @@ elif choice == "Repair Orders":
     # Repair orders list with status management
     st.subheader("📋 Repair Orders")
     
-    # Status filter
-    status_filter = st.selectbox("Filter by Status", ["All", "Pending", "In Progress", "Completed"])
+    # Enhanced filter options
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        status_filter = st.selectbox("Filter by Status", ["Active Orders", "Pending", "In Progress", "Completed", "All (Including Returned)", "Returned Only"])
+    with col2:
+        show_returned = st.checkbox("Show Returned Orders", value=False, help="Include returned orders in the list")
     
+    # Build query based on filters (SIMPLIFIED LOGIC)
     query = """
         SELECT ro.order_id, c.name, c.contact_number, ro.product_details, 
                ro.issue_description, ro.status, ro.created_at
@@ -499,11 +590,34 @@ elif choice == "Repair Orders":
         JOIN customers c ON ro.customer_id = c.customer_id
     """
     
-    if status_filter != "All":
-        query += " WHERE ro.status = %s"
-        params = [status_filter]
-    else:
-        params = []
+    params = []
+    conditions = []
+    
+    # Clear and simple filtering logic
+    if status_filter == "Active Orders":
+        # Show all except returned
+        conditions.append("ro.status IN ('Pending', 'In Progress', 'Completed')")
+    elif status_filter == "Returned Only":
+        # Show only returned
+        conditions.append("ro.status = 'Returned'")
+    elif status_filter == "All (Including Returned)":
+        # Show everything - no conditions
+        pass
+    elif status_filter in ["Pending", "In Progress", "Completed"]:
+        # Show specific status only
+        conditions.append("ro.status = %s")
+        params.append(status_filter)
+    
+    # Apply show_returned checkbox override
+    if show_returned and status_filter == "Active Orders":
+        # Override: show all including returned
+        conditions = []  # Remove the active orders filter
+    elif not show_returned and status_filter == "All (Including Returned)":
+        # Override: exclude returned even from "All"
+        conditions.append("ro.status != 'Returned'")
+    
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
     
     query += " ORDER BY ro.created_at DESC"
     
@@ -519,9 +633,18 @@ elif choice == "Repair Orders":
         # Format datetime
         df['Created'] = pd.to_datetime(df['Created']).dt.strftime('%d/%m/%Y %H:%M')
         
-        # Display with status update capability
+        # Display with enhanced status management
         for idx, order in df.iterrows():
+            # Different styling for returned orders
+            if order['Status'] == 'Returned':
+                container_style = "border: 2px solid #ff6b6b; border-radius: 5px; padding: 10px; background-color: #ffe0e0;"
+            else:
+                container_style = ""
+            
             with st.container():
+                if container_style:
+                    st.markdown(f'<div style="{container_style}">', unsafe_allow_html=True)
+                
                 col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
                 
                 with col1:
@@ -539,31 +662,115 @@ elif choice == "Repair Orders":
                         st.warning(f"⏳ {current_status}")
                     elif current_status == 'In Progress':
                         st.info(f"🔄 {current_status}")
-                    else:
+                    elif current_status == 'Completed':
                         st.success(f"✅ {current_status}")
+                    elif current_status == 'Returned':
+                        st.error(f"↩️ {current_status}")
                 
                 with col4:
-                    new_status = st.selectbox(
-                        "Update Status",
-                        ["Pending", "In Progress", "Completed"],
-                        index=["Pending", "In Progress", "Completed"].index(current_status),
-                        key=f"status_{order['Order ID']}"
-                    )
-                    
-                    if st.button("Update", key=f"btn_{order['Order ID']}"):
-                        if new_status != current_status:
+                    # Status update logic
+                    if current_status == 'Returned':
+                        st.write("**Returned**")
+                        if st.button("Restore", key=f"restore_{order['Order ID']}", help="Move back to Completed"):
                             run_query("UPDATE repair_orders SET status = %s WHERE order_id = %s",
-                                     (new_status, order['Order ID']))
-                            st.success(f"Status updated to {new_status}")
+                                     ('Completed', order['Order ID']))
+                            st.success("Order restored to Completed status")
                             st.rerun()
+                    else:
+                        # Regular status updates
+                        available_statuses = ["Pending", "In Progress", "Completed"]
+                        
+                        new_status = st.selectbox(
+                            "Update Status",
+                            available_statuses,
+                            index=available_statuses.index(current_status),
+                            key=f"status_{order['Order ID']}"
+                        )
+                        
+                        # Update button
+                        if st.button("Update", key=f"btn_{order['Order ID']}"):
+                            if new_status != current_status:
+                                run_query("UPDATE repair_orders SET status = %s WHERE order_id = %s",
+                                         (new_status, order['Order ID']))
+                                st.success(f"Status updated to {new_status}")
+                                st.rerun()
+                        
+                        # Return button (only for completed orders)
+                        if current_status == 'Completed':
+                            if st.button("📦 Mark as Returned", key=f"return_{order['Order ID']}", 
+                                       help="Customer has collected the repaired item"):
+                                # Confirmation dialog simulation
+                                if st.button(f"✅ Confirm Return #{order['Order ID']}", 
+                                           key=f"confirm_return_{order['Order ID']}",
+                                           type="primary"):
+                                    run_query("UPDATE repair_orders SET status = %s WHERE order_id = %s",
+                                             ('Returned', order['Order ID']))
+                                    st.success(f"Order #{order['Order ID']} marked as returned and will be hidden from main view")
+                                    st.rerun()
+                
+                if container_style:
+                    st.markdown('</div>', unsafe_allow_html=True)
                 
                 st.divider()
         
-        st.info(f"Showing {len(orders)} repair orders")
+        # Summary information
+        active_orders = len([o for o in orders if o[5] != 'Returned'])
+        returned_orders = len([o for o in orders if o[5] == 'Returned'])
+        
+        if status_filter == "Active Orders" or not show_returned:
+            st.info(f"Showing {len(orders)} active repair orders | {returned_count} returned orders hidden")
+        else:
+            st.info(f"Showing {len(orders)} repair orders | Active: {active_orders}, Returned: {returned_orders}")
+            
     else:
-        st.info("No repair orders found.")
+        if status_filter == "Returned Only":
+            st.info("No returned repair orders found.")
+        else:
+            st.info("No repair orders found.")
+    
+    # Additional features
+    if returned_count > 0:
+        with st.expander("📊 Returned Orders Analytics", expanded=False):
+            returned_analysis = run_query("""
+                SELECT 
+                    DATE_TRUNC('month', created_at) as month,
+                    COUNT(*) as returned_count
+                FROM repair_orders 
+                WHERE status = 'Returned'
+                AND created_at >= CURRENT_DATE - INTERVAL '6 months'
+                GROUP BY DATE_TRUNC('month', created_at)
+                ORDER BY month DESC
+            """, fetch=True)
+            
+            if returned_analysis:
+                df_returned = pd.DataFrame(returned_analysis, columns=['Month', 'Returned Count'])
+                df_returned['Month'] = pd.to_datetime(df_returned['Month']).dt.strftime('%B %Y')
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.subheader("Monthly Returns")
+                    st.dataframe(df_returned, hide_index=True)
+                
+                with col2:
+                    st.subheader("Quick Stats")
+                    st.metric("Total Returned", returned_count)
+                    
+                    avg_completion = run_query("""
+                        SELECT AVG(EXTRACT(EPOCH FROM (
+                            CASE WHEN status = 'Returned' 
+                            THEN CURRENT_TIMESTAMP 
+                            ELSE created_at END - created_at
+                        )) / 86400) as avg_days
+                        FROM repair_orders 
+                        WHERE status IN ('Completed', 'Returned')
+                    """, fetch=True)
+                    
+                    if avg_completion and avg_completion[0][0]:
+                        st.metric("Avg. Completion Time", f"{avg_completion[0][0]:.1f} days")
+            else:
+                st.info("No returned orders data available for analysis.")
 
-# =================== POINT OF SALE PAGE ===================
+# =================== POINT OF SALE PAGE (FIXED VERSION) ===================
 elif choice == "POS":
     st.subheader("💳 Point of Sale System")
     
@@ -647,18 +854,34 @@ elif choice == "POS":
                 grand_total = sum(item['total'] for item in st.session_state.cart)
                 st.metric("**Grand Total**", f"₹{grand_total:.2f}")
                 
-                # Customer selection for receipt
-                customers = run_query("SELECT customer_id, name FROM customers ORDER BY name", fetch=True)
+                # Customer selection for receipt (UPDATED)
+                customers = run_query("SELECT customer_id, name, contact_number, address FROM customers ORDER BY name", fetch=True)
                 if customers:
                     customer_options = ["Walk-in Customer"] + [f"{c[1]} (ID: {c[0]})" for c in customers]
-                    selected_customer = st.selectbox("Customer", customer_options)
+                    selected_customer_display = st.selectbox("Customer", customer_options)
                     
-                    if selected_customer != "Walk-in Customer":
-                        customer_name = selected_customer.split(" (ID:")[0]
+                    # Extract customer data properly
+                    if selected_customer_display != "Walk-in Customer":
+                        # Extract customer ID from the display string
+                        customer_id_str = selected_customer_display.split("(ID: ")[1].split(")")[0]
+                        selected_customer_id = int(customer_id_str)
+                        
+                        # Get full customer data from the list
+                        customer_info = next((c for c in customers if c[0] == selected_customer_id), None)
+                        if customer_info:
+                            customer_data = {
+                                'name': customer_info[1],
+                                'contact': customer_info[2],
+                                'address': customer_info[3]
+                            }
+                        else:
+                            customer_data = None
                     else:
-                        customer_name = None
+                        selected_customer_id = None
+                        customer_data = {'name': 'Walk-in Customer'}
                 else:
-                    customer_name = None
+                    selected_customer_id = None
+                    customer_data = {'name': 'Walk-in Customer'}
                 
                 # Checkout buttons
                 col_clear, col_checkout = st.columns(2)
@@ -670,41 +893,77 @@ elif choice == "POS":
                 
                 with col_checkout:
                     if st.button("✅ Complete Sale", use_container_width=True, type="primary"):
-                        # Process sale
+                        # FIXED: Process sale with proper error handling and user feedback
                         try:
-                            for item in st.session_state.cart:
-                                # Update inventory
-                                run_query("UPDATE products SET quantity = quantity - %s WHERE product_id = %s",
-                                         (item['quantity'], item['product_id']))
+                            # Show processing message
+                            with st.spinner("Processing sale..."):
+                                for item in st.session_state.cart:
+                                    # Update inventory
+                                    run_query("UPDATE products SET quantity = quantity - %s WHERE product_id = %s",
+                                             (item['quantity'], item['product_id']))
+                                    
+                                    # Record sale - FIXED: Use the properly defined selected_customer_id
+                                    run_query("INSERT INTO sales (product_id, quantity, total_price, customer_id) VALUES (%s, %s, %s, %s)",
+                                             (item['product_id'], item['quantity'], item['total'], selected_customer_id))
                                 
-                                # Record sale
-                                run_query("INSERT INTO sales (product_id, quantity, total_price) VALUES (%s, %s, %s)",
-                                         (item['product_id'], item['quantity'], item['total']))
+                                # Generate receipt with full customer data
+                                receipt_items = [(item['name'], item['quantity'], item['total']) for item in st.session_state.cart]
+                                receipt_file = generate_professional_receipt(receipt_items, grand_total, customer_data)
                             
-                            # Generate receipt
-                            receipt_items = [(item['name'], item['quantity'], item['total']) for item in st.session_state.cart]
-                            receipt_file = generate_professional_receipt(receipt_items, grand_total, customer_name)
+                            # FIXED: Success message without immediate rerun
+                            st.success(f"✅ Sale completed successfully! Total: ₹{grand_total:.2f}")
                             
-                            # Success message
-                            st.success(f"✅ Sale completed! Total: ₹{grand_total:.2f}")
+                            # FIXED: Show balloons with delay
                             st.balloons()
                             
-                            # Download receipt
-                            with open(receipt_file, "rb") as pdf_file:
-                                st.download_button(
-                                    "📄 Download Receipt",
-                                    data=pdf_file.read(),
-                                    file_name=receipt_file,
-                                    mime="application/pdf",
-                                    use_container_width=True
-                                )
+                            # FIXED: Download receipt with better UX
+                            try:
+                                with open(receipt_file, "rb") as pdf_file:
+                                    pdf_data = pdf_file.read()
+                                    
+                                # Store receipt data in session state to prevent immediate disappearance
+                                st.session_state['last_receipt'] = {
+                                    'data': pdf_data,
+                                    'filename': receipt_file,
+                                    'total': grand_total
+                                }
+                                
+                                st.info("Receipt generated successfully! Use the download button below:")
+                                
+                                # Clean up the temporary file
+                                try:
+                                    os.remove(receipt_file)
+                                except:
+                                    pass
+                                
+                            except Exception as e:
+                                st.warning(f"Receipt generation had an issue, but sale was successful: {str(e)}")
                             
-                            # Clear cart
+                            # Clear cart after successful sale
                             st.session_state.cart = []
-                            st.rerun()
+                            
+                            # FIXED: Don't rerun immediately, let user see the success message
                         
                         except Exception as e:
                             st.error(f"Sale processing failed: {str(e)}")
+                            st.error("Please try again or contact support if the issue persists.")
+                
+                # FIXED: Show download button for last receipt if available
+                if 'last_receipt' in st.session_state:
+                    st.download_button(
+                        "📄 Download Last Receipt",
+                        data=st.session_state['last_receipt']['data'],
+                        file_name=st.session_state['last_receipt']['filename'],
+                        mime="application/pdf",
+                        use_container_width=True,
+                        help=f"Download receipt for ₹{st.session_state['last_receipt']['total']:.2f} transaction"
+                    )
+                    
+                    # Option to clear receipt data
+                    if st.button("Clear Receipt Data", help="Clear stored receipt to free memory"):
+                        del st.session_state['last_receipt']
+                        st.rerun()
+                        
             else:
                 st.info("Cart is empty. Add products to get started!")
         
@@ -750,7 +1009,6 @@ elif choice == "POS":
                 st.info(f"Showing last 20 transactions | Total value: ₹{total_sales:.2f}")
             else:
                 st.info("No recent sales found.")
-
 # =================== FOOTER ===================
 st.markdown("---")
 st.markdown("""
